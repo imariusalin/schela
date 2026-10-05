@@ -115,7 +115,7 @@ apt-get update -y
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg apt-transport-https lsb-release \
   unzip jq rsync ufw fail2ban nginx certbot python3-certbot-nginx \
-  unattended-upgrades apt-listchanges \
+  unattended-upgrades apt-listchanges cron \
   build-essential python3
 
 # PHP 8.1–8.4 (Ondřej / Sury)
@@ -180,7 +180,9 @@ log "Users and directories"
 id -u schela >/dev/null 2>&1 || useradd --system --home /var/lib/schela --shell /usr/sbin/nologin schela
 id -u schelawww >/dev/null 2>&1 || useradd --system --home /nonexistent --shell /usr/sbin/nologin schelawww
 id -u vmail >/dev/null 2>&1 || useradd --system --home /var/mail/schela --shell /usr/sbin/nologin vmail
-install -d -m 0750 -o schela -g schela /var/lib/schela /var/lib/schela/pglite /var/lib/schela/apps /var/lib/schela/mail /var/lib/schela/bind /var/lib/schela/logs
+install -d -m 0750 -o schela -g schela /var/lib/schela /var/lib/schela/pglite /var/lib/schela/apps /var/lib/schela/logs
+# Written by schela-apply as root and read by postfix, never by the panel.
+install -d -m 0755 -o root -g root /var/lib/schela/mail
 install -d -m 0755 /opt/schela /etc/nginx/schela.d /etc/nginx/schela-apps.d
 install -d -m 0750 -o vmail -g vmail /var/mail/schela
 
@@ -233,6 +235,8 @@ install -m 0755 "$HERE/schela" /usr/local/sbin/schela
 install -m 0755 "$HERE/schela-files" /usr/local/sbin/schela-files
 install -m 0755 "$HERE/schela-backup" /usr/local/sbin/schela-backup
 install -m 0755 "$HERE/schela-workers" /usr/local/sbin/schela-workers
+install -m 0755 "$HERE/schela-db" /usr/local/sbin/schela-db
+install -m 0755 "$HERE/schela-purge" /usr/local/sbin/schela-purge
 install -m 0644 "$HERE/templates/sudoers" /etc/sudoers.d/schela
 chmod 0440 /etc/sudoers.d/schela
 visudo -cf /etc/sudoers.d/schela >/dev/null
@@ -273,7 +277,12 @@ if [ -d /opt/schela/.output/server ]; then
     done
   fi
 fi
-chown -R schela:schela /var/lib/schela
+# The panel owns its data. mail, dkim and db are root's (schela-apply):
+# postfix and opendkim read them, and dkim and db hold secrets.
+chown schela:schela /var/lib/schela
+find /var/lib/schela -mindepth 1 -maxdepth 1 \
+  ! -name mail ! -name dkim ! -name db \
+  -exec chown -R schela:schela {} +
 chown -R schela:schela /opt/schela
 
 log "Nginx panel vhost"

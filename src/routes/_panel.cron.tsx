@@ -2,7 +2,8 @@ import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
 import { Clock, Plus } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { PageHeader } from "@/components/page-header";
+import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -24,9 +25,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { CRON_PRESETS } from "@/lib/panel/net";
-import { createCron, deleteCron, listCron, toggleCron } from "@/lib/panel/ops";
-import { appSystemUser } from "@/lib/utils";
+import { appSystemUser } from "@/features/apps/apps";
+import { createCron, deleteCron, listCron, toggleCron } from "@/features/cron/api";
+import { CRON_PRESETS } from "@/features/cron/cron";
+import type { CronJob } from "@/features/cron/types";
 
 export const Route = createFileRoute("/_panel/cron")({
   loader: () => listCron(),
@@ -44,6 +46,7 @@ function CronPage() {
   const [preset, setPreset] = useState<string>(CRON_PRESETS[1].value);
   const [custom, setCustom] = useState("");
   const [command, setCommand] = useState("");
+  const [removing, setRemoving] = useState<CronJob | null>(null);
 
   const targets = kind === "site" ? sites : apps;
   const schedule = custom.trim() || preset;
@@ -147,9 +150,7 @@ function CronPage() {
                   <Button
                     variant="ghost"
                     size="sm"
-                    onClick={() =>
-                      void deleteCron({ data: { id: job.id } }).then(() => router.invalidate())
-                    }
+                    onClick={() => setRemoving(job)}
                   >
                     Remove
                   </Button>
@@ -266,6 +267,20 @@ function CronPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {removing ? (
+        <ConfirmDeleteDialog
+          title={`Remove ${removing.name || "this cron job"}?`}
+          description={<span className="font-mono">{removing.schedule} {removing.command}</span>}
+          confirmLabel="Remove job"
+          onConfirm={async () => {
+            await deleteCron({ data: { id: removing.id } });
+            toast.success("Cron job removed");
+            await router.invalidate();
+          }}
+          onClose={() => setRemoving(null)}
+        />
+      ) : null}
     </div>
   );
 }

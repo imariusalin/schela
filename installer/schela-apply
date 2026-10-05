@@ -18,6 +18,51 @@ ok_node()   { [[ "$1" =~ ^(18|20|22)$ ]]; }
 ok_port()   { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 ok_ipv4()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
+# A TXT value as bind wants it: quoted strings of at most 255 bytes each.
+txt_strings() {
+  local v="$1" out=""
+  [ -n "$v" ] || { printf '""'; return; }
+  while [ -n "$v" ]; do
+    out+="\"${v:0:255}\" "
+    v="${v:255}"
+  done
+  printf '%s' "${out% }"
+}
+
+# The public key from an opendkim-genkey zone snippet:
+#   mail._domainkey IN TXT ( "v=DKIM1; h=sha256; k=rsa; " "p=MIIB..." "..." )
+# Only the quoted text counts; tabs and parentheses around it are dropped.
+dkim_key() {
+  grep -o '"[^"]*"' "$1" | tr -d '"\n\t ' | sed -n 's/.*p=\([^;]*\).*/\1/p' || true
+}
+
+# A hostname as an absolute zone-file name. Without the final dot bind appends
+# the zone: "ns1.example.com" in example.com becomes ns1.example.com.example.com.
+fqdn() {
+  printf '%s.' "${1%.}"
+}
+
+# A records for name servers inside the zone that have none, e.g.
+# ns1.example.com in example.com. Bind refuses a zone whose own name server has
+# no address. They point at the zone's apex A record; no apex A, no glue.
+#   ns_glue <zone json> <zone name>
+ns_glue() {
+  local zone="$1" zname="$2" apex ns host
+  apex="$(jq -r '[.records[]? | select(.type == "A" and .name == "@") | .value][0] // empty' <<<"$zone")"
+  ok_ipv4 "$apex" || return 0
+  while IFS= read -r ns; do
+    ns="${ns%.}"
+    case "$ns" in
+      *."$zname") host="${ns%."$zname"}" ;;
+      *) continue ;;
+    esac
+    [[ "$host" =~ ^[A-Za-z0-9-]+$ ]] || continue
+    if ! jq -e --arg h "$host" 'any(.records[]?; .type == "A" and .name == $h)' <<<"$zone" >/dev/null; then
+      echo "${host} 300 IN A ${apex}"
+    fi
+  done < <(jq -r '.records[]? | select(.type == "NS") | .value' <<<"$zone" | sort -u)
+}
+
 bind_http() {
   ip="${1:-}"
   if ok_ipv4 "$ip"; then
@@ -37,6 +82,30 @@ bind_https() {
 }
 
 nologin_shell() { command -v nologin 2>/dev/null || echo /usr/sbin/nologin; }
+
+# Run a command as a site user. Everything below /home/<user> belongs to that
+# user, who can replace any entry there (for example turn www into a symlink),
+# so files inside the home are created and changed with the user's own
+# permissions, never root's.
+as_user() {
+  local user="$1"
+  shift
+  runuser -u "$user" -- "$@"
+}
+
+# /home/<user> itself: created by root if missing (useradd normally does it).
+# /home is root-owned, so only root could have made this path a link; refuse
+# one rather than change whatever it points at.
+ensure_home() {
+  local user="$1" home="/home/$1"
+  if [ -L "$home" ]; then
+    log "skip $user: $home is a symlink"
+    return 1
+  fi
+  [ -d "$home" ] || install -d -o "$user" -g "$user" -m 750 "$home"
+  chown "$user:$user" "$home"
+  chmod 750 "$home"
+}
 
 [ "$(id -u)" -eq 0 ] || die "root required"
 need jq
@@ -142,17 +211,18 @@ apply_sites() {
 
     ensure_user "$user" "/home/$user"
     if [ "$DRY" -eq 0 ]; then
-      mkdir -p "/home/$user/www" "/home/$user/tmp" "/home/$user/logs"
+      ensure_home "$user" || continue
+      # Repairs ownership of anything root created here before; chown -R
+      # changes links themselves and does not follow them.
       chown -R "$user:$user" "/home/$user"
-      chmod 750 "/home/$user"
-      chmod 750 "/home/$user/www"
+      as_user "$user" mkdir -p "/home/$user/www" "/home/$user/tmp" "/home/$user/logs" \
+        || log "site $domain: could not create www, tmp or logs"
+      as_user "$user" chmod 750 "/home/$user/www" || log "site $domain: could not set the mode of www"
       # nginx (www-data) must traverse the jail to serve static files / try_files.
       usermod -aG "$user" www-data 2>/dev/null || true
-      if [ ! -f "/home/$user/www/index.php" ]; then
-        printf '<?php echo htmlspecialchars(%s, ENT_QUOTES, "UTF-8");\n' "'${domain}'" \
-          >"/home/$user/www/index.php"
-        chown "$user:$user" "/home/$user/www/index.php"
-      fi
+      printf '<?php echo htmlspecialchars(%s, ENT_QUOTES, "UTF-8");\n' "'${domain}'" \
+        | as_user "$user" sh -c '[ -e "$1" ] || cat >"$1"' sh "/home/$user/www/index.php" \
+        || log "site $domain: could not write the placeholder index.php"
     fi
 
     socket="/run/php/${pool}.sock"
@@ -196,11 +266,17 @@ apply_sites() {
 }
 
 # --- node apps -------------------------------------------------------------
+# Where unit files go. Tests point this at a scratch directory.
+SYSTEMD_DIR="${SCHELA_SYSTEMD_DIR:-/etc/systemd/system}"
+
 apply_apps() {
   mkdir -p /etc/nginx/schela-apps.d /var/lib/schela/apps
   if [ "$DRY" -eq 0 ]; then
     find /etc/nginx/schela-apps.d -name 'app-*.conf' -delete 2>/dev/null || true
   fi
+  # Units of every app still in the panel, valid or not; anything else is a
+  # deleted app and gets stopped and removed below.
+  declare -A keep_units=()
 
   while IFS= read -r app; do
     [ -n "$app" ] || continue
@@ -217,6 +293,7 @@ apply_apps() {
     slug="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')"
     unit="schela-app-${slug}"
     user="sa_${slug:0:20}"
+    keep_units["$unit"]=1
 
     ok_domain "$domain" || { log "skip app, bad domain"; continue; }
     ok_node "$ver" || { log "skip $name, bad node $ver"; continue; }
@@ -229,8 +306,9 @@ apply_apps() {
 
     ensure_user "$user" "/home/$user"
     if [ "$DRY" -eq 0 ]; then
-      mkdir -p "/home/$user/app"
+      ensure_home "$user" || continue
       chown -R "$user:$user" "/home/$user"
+      as_user "$user" mkdir -p "/home/$user/app" || log "app $name: could not create app"
       printf 'PORT=%s\nNODE_VERSION=%s\n' "$port" "$ver" >"/var/lib/schela/apps/${user}.env"
 
       NODE_BIN="/usr/local/bin/node"
@@ -241,7 +319,7 @@ apply_apps() {
         fi
       fi
 
-      cat >"/etc/systemd/system/${unit}.service" <<UNIT
+      cat >"$SYSTEMD_DIR/${unit}.service" <<UNIT
 [Unit]
 Description=Schela Node app ${name}
 After=network.target
@@ -282,10 +360,25 @@ UNIT
       SSL_DOMAINS+=("$domain")
     fi
   done < <(jq -c '.apps // [] | .[]' "$STATE")
+
+  [ "$DRY" -eq 0 ] || return 0
+  local unit_file stale removed=0
+  for unit_file in "$SYSTEMD_DIR"/schela-app-*.service; do
+    [ -f "$unit_file" ] || continue
+    stale="$(basename "$unit_file" .service)"
+    [[ "$stale" =~ ^schela-app-[a-z0-9-]+$ ]] || continue
+    [ -n "${keep_units[$stale]:-}" ] && continue
+    log "removing unit of deleted app: $stale"
+    systemctl disable --now "$stale" >/dev/null 2>&1 || true
+    rm -f "$unit_file"
+    removed=1
+  done
+  if [ "$removed" -eq 1 ]; then
+    systemctl daemon-reload
+  fi
 }
 
 # --- site workers (queues, Horizon, scheduler) ------------------------------
-SYSTEMD_DIR="${SCHELA_SYSTEMD_DIR:-/etc/systemd/system}"
 # argv must be 1-32 non-empty strings without control characters.
 WORKER_ARGV_OK='(.argv | type == "array") and (.argv | length >= 1 and length <= 32) and (.argv | all(type == "string" and length >= 1 and length <= 200 and (test("[[:cntrl:]]") | not)))'
 # Quote one ExecStart= argument: inside double quotes systemd unescapes \\ and
@@ -503,7 +596,10 @@ apply_mail() {
   mod_on mail || return 0
   [ -d /etc/postfix ] || return 0
   [ "$DRY" -eq 1 ] && { log "would apply mail maps"; return; }
-  mkdir -p /var/lib/schela/mail /var/mail/schela
+  # Root writes the maps; postfix reads them. Reset owner and mode on every run
+  # so an install that handed the folder to the panel user heals itself.
+  install -d -m 0755 -o root -g root /var/lib/schela/mail
+  mkdir -p /var/mail/schela
   if ! id -u vmail >/dev/null 2>&1; then
     useradd --system --home /var/mail/schela --shell "$(nologin_shell)" vmail
   fi
@@ -556,6 +652,8 @@ apply_mail() {
   done < <(jq -c '.mailboxes // [] | .[]' "$STATE")
   chown -R vmail:vmail /var/mail/schela
   postmap /var/lib/schela/mail/vmailbox 2>/dev/null || true
+  chown root:root /var/lib/schela/mail/vmailbox /var/lib/schela/mail/vmailbox.db /var/lib/schela/mail/vdomains 2>/dev/null || true
+  chmod 644 /var/lib/schela/mail/vmailbox /var/lib/schela/mail/vmailbox.db /var/lib/schela/mail/vdomains 2>/dev/null || true
   postconf -e "virtual_mailbox_base = /var/mail/schela"
   postconf -e "virtual_mailbox_maps = hash:/var/lib/schela/mail/vmailbox"
   postconf -e "virtual_mailbox_domains = /var/lib/schela/mail/vdomains"
@@ -630,8 +728,18 @@ DOVE
 }
 
 # --- cron ------------------------------------------------------------------
+# /etc/cron.d comes with the cron package. Without it the files are still
+# written (so jobs start once cron is installed) but nothing runs them.
+ensure_cron_dir() {
+  install -d -m 0755 /etc/cron.d
+  if ! command -v cron >/dev/null 2>&1 && ! command -v crond >/dev/null 2>&1; then
+    log "cron is not installed: cron jobs and scheduled backups will not run (apt-get install cron)"
+  fi
+}
+
 apply_cron() {
   [ "$DRY" -eq 1 ] && { log "would apply cron jobs"; return; }
+  ensure_cron_dir
   dest=/etc/cron.d/schela-jobs
   {
     echo "SHELL=/bin/sh"
@@ -662,6 +770,7 @@ apply_cron() {
 # --- backups ---------------------------------------------------------------
 apply_backups() {
   [ "$DRY" -eq 1 ] && { log "would apply backup cron"; return; }
+  ensure_cron_dir
   dest=/etc/cron.d/schela-backups
   {
     echo "SHELL=/bin/sh"
@@ -758,12 +867,139 @@ EOF
   fi
 }
 
+# --- databases (MariaDB, PostgreSQL) ----------------------------------------
+# The engine is installed when its module is turned on and only stopped when it
+# is turned off: the package and the data stay. Databases, users and access are
+# synced by schela-db, which never drops anything.
+DB_SYNC="${SCHELA_DB:-/usr/local/sbin/schela-db}"
+DB_FAILED=0
+
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y >/dev/null
+  apt-get install -y --no-install-recommends "$@"
+}
+
+# Write a managed config file; returns 0 when its content changed.
+write_if_changed() {
+  dest="$1"
+  content="$2"
+  if [ -f "$dest" ] && [ "$(cat "$dest")" = "$content" ]; then
+    return 1
+  fi
+  printf '%s\n' "$content" >"$dest"
+  chmod 644 "$dest"
+  return 0
+}
+
+db_sync() {
+  "$DB_SYNC" sync "$1" || { log "$1: database sync failed"; DB_FAILED=1; }
+}
+
+apply_mariadb() {
+  if ! mod_on mariadb; then
+    if [ "$DRY" -eq 1 ]; then
+      log "would stop mariadb (keep package and data, no boot start)"
+    elif [ -f /etc/mysql/mariadb.conf.d/99-schela.cnf ]; then
+      # Only a server schela set up; a MariaDB installed by hand is left alone.
+      log "mariadb off: stop, disable boot start (package and data stay)"
+      systemctl disable --now mariadb >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  if [ "$DRY" -eq 1 ]; then
+    log "would install/enable mariadb and sync databases"
+    return 0
+  fi
+  if ! command -v mariadbd >/dev/null 2>&1 && [ ! -x /usr/sbin/mariadbd ]; then
+    log "installing mariadb-server"
+    apt_install mariadb-server mariadb-client
+  fi
+  restart=0
+  mkdir -p /etc/mysql/mariadb.conf.d
+  if write_if_changed /etc/mysql/mariadb.conf.d/99-schela.cnf "# Managed by schela-apply.
+[mysqld]
+bind-address = 127.0.0.1
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci"; then
+    restart=1
+  fi
+  systemctl unmask mariadb >/dev/null 2>&1 || true
+  systemctl enable mariadb >/dev/null 2>&1 || true
+  if [ "$restart" -eq 1 ]; then
+    systemctl restart mariadb || { log "mariadb did not start"; DB_FAILED=1; return 0; }
+  else
+    systemctl start mariadb || { log "mariadb did not start"; DB_FAILED=1; return 0; }
+  fi
+  for _ in $(seq 1 30); do
+    mariadb-admin --protocol=socket ping >/dev/null 2>&1 && break
+    sleep 1
+  done
+  db_sync mariadb
+}
+
+pg_conf_dir() {
+  ls -d /etc/postgresql/*/main 2>/dev/null | sort -V | tail -1
+}
+
+apply_postgresql() {
+  if ! mod_on postgresql; then
+    if [ "$DRY" -eq 1 ]; then
+      log "would stop postgresql (keep package and data, no boot start)"
+    elif [ -n "$(pg_conf_dir)" ] && [ -f "$(pg_conf_dir)/conf.d/99-schela.conf" ]; then
+      # Only a server schela set up; a PostgreSQL installed by hand is left alone.
+      log "postgresql off: stop, disable boot start (package and data stay)"
+      systemctl disable --now postgresql >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  if [ "$DRY" -eq 1 ]; then
+    log "would install/enable postgresql and sync databases"
+    return 0
+  fi
+  if ! ls /usr/lib/postgresql/*/bin/postgres >/dev/null 2>&1; then
+    log "installing postgresql"
+    apt_install postgresql postgresql-client
+  fi
+  conf="$(pg_conf_dir)"
+  [ -n "$conf" ] || { log "postgresql: no cluster under /etc/postgresql"; DB_FAILED=1; return 0; }
+  restart=0
+  mkdir -p "$conf/conf.d"
+  if write_if_changed "$conf/conf.d/99-schela.conf" "# Managed by schela-apply.
+listen_addresses = 'localhost'
+password_encryption = 'scram-sha-256'"; then
+    restart=1
+  fi
+  systemctl unmask postgresql >/dev/null 2>&1 || true
+  systemctl enable postgresql >/dev/null 2>&1 || true
+  if [ "$restart" -eq 1 ]; then
+    systemctl restart postgresql || { log "postgresql did not start"; DB_FAILED=1; return 0; }
+  else
+    systemctl start postgresql || { log "postgresql did not start"; DB_FAILED=1; return 0; }
+  fi
+  for _ in $(seq 1 30); do
+    pg_isready -q >/dev/null 2>&1 && break
+    sleep 1
+  done
+  db_sync postgresql
+}
+
 # --- dns -------------------------------------------------------------------
 apply_dns() {
   mod_on dns || return 0
   [ -d /etc/bind ] || return 0
   [ "$DRY" -eq 1 ] && { log "would apply bind zones"; return; }
-  mkdir -p /var/lib/schela/bind
+  # Root writes the zones; named (user bind) reads them. They live under
+  # /var/lib/bind because named's AppArmor profile (Ubuntu, Debian) only lets
+  # it read zone files from its own directories.
+  local zdir=/var/lib/bind/schela
+  if getent group bind >/dev/null 2>&1; then
+    install -d -m 0750 -o root -g bind "$zdir"
+  else
+    install -d -m 0755 -o root -g root "$zdir"
+  fi
+  # Zones used to be written here, where named could not read them.
+  rm -rf /var/lib/schela/bind
   : >/etc/bind/schela-zones.conf
   while IFS= read -r zone; do
     [ -n "$zone" ] || continue
@@ -771,7 +1007,9 @@ apply_dns() {
     serial="$(jq -r '.serial' <<<"$zone")"
     ok_domain "$zname" || continue
     [[ "$serial" =~ ^[0-9]+$ ]] || serial="$(date +%Y%m%d01)"
-    zfile="/var/lib/schela/bind/${zname}.zone"
+    zfile="${zdir}/${zname}.zone"
+    dkim_p=""
+    [ -f "/var/lib/schela/dkim/${zname}.txt" ] && dkim_p="$(dkim_key "/var/lib/schela/dkim/${zname}.txt")"
     {
       echo "\$TTL 300"
       echo "@ IN SOA ns1.${zname}. hostmaster.${zname}. (${serial} 3600 600 86400 300)"
@@ -785,27 +1023,35 @@ apply_dns() {
         [[ "$t" =~ ^(A|AAAA|CNAME|MX|TXT|NS)$ ]] || continue
         [[ "$n" =~ ^[@A-Za-z0-9._*-]+$ ]] || continue
         [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=300
+        # The panel stores a placeholder DKIM record; the real key replaces it.
+        [ -n "$dkim_p" ] && [ "$t" = "TXT" ] && [ "$n" = "mail._domainkey" ] && continue
         v="${v//$'\n'/}"
         v="${v//\"/}"
         if [ "$t" = "MX" ]; then
           [[ "$prio" =~ ^[0-9]+$ ]] || prio=10
-          echo "${n} ${ttl} IN MX ${prio} ${v}."
+          echo "${n} ${ttl} IN MX ${prio} $(fqdn "$v")"
         elif [ "$t" = "TXT" ]; then
-          echo "${n} ${ttl} IN TXT \"${v}\""
+          echo "${n} ${ttl} IN TXT $(txt_strings "$v")"
+        elif [ "$t" = "NS" ] || [ "$t" = "CNAME" ]; then
+          echo "${n} ${ttl} IN ${t} $(fqdn "$v")"
         else
           echo "${n} ${ttl} IN ${t} ${v}"
         fi
       done < <(jq -c '.records // [] | .[]' <<<"$zone")
-      if [ -f "/var/lib/schela/dkim/${zname}.txt" ]; then
-        p="$(tr -d '\n" ' <"/var/lib/schela/dkim/${zname}.txt" | sed -n 's/.*p=\([^;]*\).*/\1/p')"
-        if [ -n "$p" ]; then
-          echo "mail._domainkey 300 IN TXT \"v=DKIM1; k=rsa; p=${p}\""
-        fi
+      ns_glue "$zone" "$zname"
+      if [ -n "$dkim_p" ]; then
+        echo "mail._domainkey 300 IN TXT $(txt_strings "v=DKIM1; k=rsa; p=${dkim_p}")"
       fi
     } >"$zfile"
     chmod 644 "$zfile"
     echo "zone \"${zname}\" { type master; file \"${zfile}\"; };" >>/etc/bind/schela-zones.conf
   done < <(jq -c '.dns.zones // [] | .[]' "$STATE")
+  # A zone deleted in the panel is no longer listed; its file goes too.
+  local zf
+  for zf in "$zdir"/*.zone; do
+    [ -f "$zf" ] || continue
+    grep -qF "file \"${zf}\";" /etc/bind/schela-zones.conf || rm -f "$zf"
+  done
   grep -q 'schela-zones.conf' /etc/bind/named.conf.local 2>/dev/null || \
     echo 'include "/etc/bind/schela-zones.conf";' >>/etc/bind/named.conf.local
   named-checkconf >/dev/null 2>&1 && systemctl reload bind9 >/dev/null 2>&1 || true
@@ -876,6 +1122,8 @@ apply_dns
 apply_cron
 apply_backups
 apply_redis
+apply_mariadb
+apply_postgresql
 
 if [ "$DRY" -eq 0 ]; then
   mkdir -p "$ACME_ROOT/.well-known/acme-challenge"
@@ -891,4 +1139,7 @@ if [ "$DRY" -eq 0 ]; then
     systemctl reload nginx
   fi
 fi
+# A failed database sync must not hold back nginx and TLS, but the panel
+# still has to hear about it.
+[ "$DB_FAILED" -eq 0 ] || die "database changes were not fully applied (see the log above)"
 log "done"

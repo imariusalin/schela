@@ -2,7 +2,8 @@ import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
 import { Box, FolderOpen, MoreHorizontal, Plus } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
-import { PageHeader } from "@/components/page-header";
+import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -29,9 +30,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { createApp, deleteApp, listApps, updateApp } from "@/lib/panel/server";
-import { NODE_VERSIONS } from "@/lib/panel/types";
-import { nodeUserFromDomain } from "@/lib/utils";
+import { createApp, deleteApp, getAppRemoval, listApps, updateApp } from "@/features/apps/api";
+import { NODE_VERSIONS, nodeUserFromDomain } from "@/features/apps/apps";
+import type { NodeApp } from "@/features/apps/types";
+import { notifyRemoved } from "@/lib/notify";
 
 export const Route = createFileRoute("/_panel/apps")({
   loader: () => listApps(),
@@ -48,6 +50,7 @@ function AppsPage() {
   const [nodeVersion, setNodeVersion] = useState("22");
   const [entry, setEntry] = useState("server.js");
   const [instances, setInstances] = useState("1");
+  const [removing, setRemoving] = useState<NodeApp | null>(null);
 
   const userPreview = domain ? nodeUserFromDomain(domain) : "n_app";
 
@@ -167,15 +170,7 @@ function AppsPage() {
                       >
                         {app.status === "running" ? "Stop" : "Start"}
                       </DropdownMenuItem>
-                      <DropdownMenuItem
-                        variant="destructive"
-                        onClick={() =>
-                          void deleteApp({ data: { id: app.id } }).then(() => {
-                            toast.success("App removed");
-                            return router.invalidate();
-                          })
-                        }
-                      >
+                      <DropdownMenuItem variant="destructive" onClick={() => setRemoving(app)}>
                         Remove
                       </DropdownMenuItem>
                     </DropdownMenuContent>
@@ -262,6 +257,21 @@ function AppsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {removing ? (
+        <ConfirmDeleteDialog
+          title={`Remove ${removing.name}?`}
+          description="The app stops and its proxy is removed. This cannot be undone."
+          confirmLabel="Remove app"
+          loadPlan={() => getAppRemoval({ data: { id: removing.id } })}
+          onConfirm={async ({ remove, confirm }) => {
+            const { warnings } = await deleteApp({ data: { id: removing.id, remove, confirm } });
+            notifyRemoved(`Removed ${removing.name}`, warnings);
+            await router.invalidate();
+          }}
+          onClose={() => setRemoving(null)}
+        />
+      ) : null}
     </div>
   );
 }
