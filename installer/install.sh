@@ -115,7 +115,7 @@ apt-get update -y
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg apt-transport-https lsb-release \
   unzip jq rsync ufw fail2ban nginx certbot python3-certbot-nginx \
-  unattended-upgrades apt-listchanges \
+  unattended-upgrades apt-listchanges cron \
   build-essential python3
 
 # PHP 8.1–8.4 (Ondřej / Sury)
@@ -233,6 +233,7 @@ install -m 0755 "$HERE/schela" /usr/local/sbin/schela
 install -m 0755 "$HERE/schela-files" /usr/local/sbin/schela-files
 install -m 0755 "$HERE/schela-backup" /usr/local/sbin/schela-backup
 install -m 0755 "$HERE/schela-workers" /usr/local/sbin/schela-workers
+install -m 0755 "$HERE/schela-db" /usr/local/sbin/schela-db
 install -m 0644 "$HERE/templates/sudoers" /etc/sudoers.d/schela
 chmod 0440 /etc/sudoers.d/schela
 visudo -cf /etc/sudoers.d/schela >/dev/null
