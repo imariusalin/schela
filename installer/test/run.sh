@@ -246,8 +246,6 @@ chmod 755 /usr/bin/systemctl /usr/bin/journalctl
 id -u s_w >/dev/null 2>&1 || useradd --home /home/s_w --create-home --shell /usr/sbin/nologin s_w
 export SCHELA_SYSTEMD_DIR=/tmp/schela-systemd
 export SCHELA_STATE=/tmp/schela-workers-state.json
-# A full apply also writes the cron files; minimal images (Debian 13) ship without cron.
-mkdir -p /etc/cron.d
 rm -rf "$SCHELA_SYSTEMD_DIR"; mkdir -p "$SCHELA_SYSTEMD_DIR/multi-user.target.wants"
 
 write_state() {
@@ -255,10 +253,11 @@ write_state() {
 import json, sys
 workers = json.loads(sys.argv[1])
 sites = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+apps = json.loads(sys.argv[3]) if len(sys.argv) > 3 else []
 json.dump({
   "settings": {"hostname": "panel.test"},
   "modules": {"php": True, "node": False, "firewall": False, "mail": False, "dns": False, "ssl": False, "redis": False, "backups": False},
-  "sites": sites, "apps": [], "firewall": [], "mailboxes": [], "cron": [], "backups": [], "dns": {"zones": []},
+  "sites": sites, "apps": apps, "firewall": [], "mailboxes": [], "cron": [], "backups": [], "dns": {"zones": []},
   "workers": workers,
 }, open("/tmp/schela-workers-state.json", "w"))
 PY
@@ -375,6 +374,53 @@ for case_root in "/home/s_root/www/public|/home/s_root/www/public" "/home/s_root
 done
 pass "document root stays inside the site's www"
 
+echo "== site home links"
+site_state() {
+  write_state '[]' "[{\"domain\":\"link.test\",\"systemUser\":\"s_link\",\"pool\":\"php83-s_link\",\"phpVersion\":\"8.3\",\"memoryLimit\":\"256M\",\"root\":\"/home/s_link/www\",\"status\":\"active\",\"isolated\":true,\"ssl\":false,\"forceHttps\":false,\"ip\":\"\"}]"
+}
+id -u s_link >/dev/null 2>&1 || useradd --home /home/s_link --create-home --shell /usr/sbin/nologin s_link
+site_state
+
+# Fresh site: www, tmp and logs belong to the user, placeholder escapes the domain.
+rm -rf /home/s_link/www /home/s_link/tmp /home/s_link/logs
+apply_now
+[ "$(stat -c %U:%a /home/s_link/www)" = "s_link:750" ] || fail "fresh www has wrong owner/mode"
+[ "$(stat -c %U /home/s_link/tmp /home/s_link/logs | sort -u)" = "s_link" ] || fail "tmp/logs not owned by the site user"
+[ "$(stat -c %U:%a /home/s_link/www/index.php)" = "s_link:644" ] || fail "placeholder has wrong owner/mode"
+grep -qF "htmlspecialchars('link.test'" /home/s_link/www/index.php || fail "placeholder content wrong"
+echo 'custom' >/home/s_link/www/index.php
+apply_now
+[ "$(cat /home/s_link/www/index.php)" = "custom" ] || fail "existing index.php was overwritten"
+pass "fresh site gets a user-owned www and a placeholder that is never overwritten"
+
+# The site user replaces www with a link to a directory it does not own.
+mkdir -p /etc/schela-www-target && chmod 755 /etc/schela-www-target && echo keep >/etc/schela-www-target/f
+rm -rf /home/s_link/www && ln -s /etc/schela-www-target /home/s_link/www && chown -h s_link:s_link /home/s_link/www
+apply_now
+[ "$(stat -c %U:%a /etc/schela-www-target)" = "root:755" ] || fail "linked www target changed owner/mode"
+[ ! -e /etc/schela-www-target/index.php ] || fail "placeholder written through the www link"
+[ "$(stat -c %U /etc/schela-www-target/f)" = "root" ] || fail "file behind the www link changed owner"
+[ -f /etc/nginx/schela.d/site-link.test.conf ] || fail "site config not written when www is a link"
+pass "a www link to another user's directory is not followed with root rights"
+
+# tmp and logs links are not followed either.
+rm -rf /home/s_link/www /home/s_link/tmp && mkdir -p /etc/schela-tmp-target && chmod 755 /etc/schela-tmp-target
+ln -s /etc/schela-tmp-target /home/s_link/tmp && chown -h s_link:s_link /home/s_link/tmp
+apply_now
+[ "$(stat -c %U:%a /etc/schela-tmp-target)" = "root:755" ] || fail "linked tmp target changed owner/mode"
+[ "$(stat -c %U:%a /home/s_link/www)" = "s_link:750" ] || fail "www not created next to a linked tmp"
+pass "tmp and logs links are not followed with root rights"
+
+# A deploy-style link to a directory the user owns keeps working.
+rm -rf /home/s_link/www /home/s_link/tmp
+as_site() { runuser -u s_link -- "$@"; }
+as_site mkdir -p /home/s_link/releases/1 && as_site ln -s /home/s_link/releases/1 /home/s_link/www
+apply_now
+[ "$(stat -c %U:%a /home/s_link/releases/1)" = "s_link:750" ] || fail "user-owned www target not set to 750"
+[ "$(stat -c %U /home/s_link/releases/1/index.php)" = "s_link" ] || fail "placeholder not written into the user's release"
+pass "a www link to the user's own release directory still works"
+rm -rf /home/s_link/www /home/s_link/releases /etc/schela-www-target /etc/schela-tmp-target
+
 echo "== schela-workers helper"
 export SCHELA_STATE=/tmp/schela-workers-state.json
 write_state "[$W]"
@@ -411,6 +457,46 @@ pass "helper rejects bad ids, unknown ops, stopped workers and extra fields"
 out="$(printf '%s' '{"op":"logs","id":7}' | SUDO_USER=schela SCHELA_STATE=/tmp/schela-workers-state.json python3 "$INS/schela-workers" || true)"
 echo "$out" | grep -q 'Panel state is not readable' || fail "helper honoured SCHELA_STATE under sudo"
 pass "helper ignores SCHELA_STATE when run through sudo"
+
+echo "== cron directory"
+export SCHELA_STATE=/tmp/schela-workers-state.json
+# Minimal images (Debian 13) ship without cron, so /etc/cron.d may not exist.
+rm -rf /etc/cron.d
+write_state '[]'
+apply_now
+[ -f /etc/cron.d/schela-jobs ] && [ -f /etc/cron.d/schela-backups ] || fail "cron files not written without /etc/cron.d"
+[ "$(stat -c %a /etc/cron.d)" = "755" ] || fail "/etc/cron.d created with the wrong mode"
+if ! command -v cron >/dev/null 2>&1; then
+  grep -q 'cron is not installed' /tmp/schela-apply.out || fail "missing cron daemon not reported"
+fi
+pass "apply works without /etc/cron.d and says when cron is missing"
+
+echo "== node app units"
+app() { printf '{"name":"%s","domain":"%s","nodeVersion":"22","port":%s,"entry":"index.js","status":"running","ip":""}' "$1" "$2" "$3"; }
+rm -f "$SCHELA_SYSTEMD_DIR"/schela-app-*.service
+printf '[Unit]\n' >"$SCHELA_SYSTEMD_DIR/schela-app@.service"
+printf '[Unit]\n' >"$SCHELA_SYSTEMD_DIR/unrelated.service"
+write_state '[]' '[]' "[$(app api api.test 3001),$(app web web.test 3002)]"
+apply_now
+[ -f "$SCHELA_SYSTEMD_DIR/schela-app-api.service" ] && [ -f "$SCHELA_SYSTEMD_DIR/schela-app-web.service" ] \
+  || fail "app units not written"
+grep -qx 'enable --now schela-app-api' /tmp/systemctl.log || fail "app not started"
+# web is deleted; api stays. A broken entry for a third app keeps its old unit.
+printf '[Unit]\n' >"$SCHELA_SYSTEMD_DIR/schela-app-broken.service"
+write_state '[]' '[]' "[$(app api api.test 3001),$(app broken broken.test 99999)]"
+apply_now
+[ ! -e "$SCHELA_SYSTEMD_DIR/schela-app-web.service" ] || fail "deleted app kept its unit"
+grep -qx 'disable --now schela-app-web' /tmp/systemctl.log || fail "deleted app was not stopped"
+grep -qx 'daemon-reload' /tmp/systemctl.log || fail "no daemon-reload after removing a unit"
+[ -f "$SCHELA_SYSTEMD_DIR/schela-app-api.service" ] || fail "kept app lost its unit"
+! grep -q 'disable --now schela-app-api' /tmp/systemctl.log || fail "kept app was stopped"
+[ -f "$SCHELA_SYSTEMD_DIR/schela-app-broken.service" ] || fail "unit of an app still in the panel was removed"
+[ -f "$SCHELA_SYSTEMD_DIR/schela-app@.service" ] && [ -f "$SCHELA_SYSTEMD_DIR/unrelated.service" ] \
+  || fail "removed a unit that is not a deleted app's"
+apply_now
+! grep -q '^disable --now schela-app' /tmp/systemctl.log || { cat /tmp/systemctl.log; fail "second apply stopped an app"; }
+pass "units of deleted Node apps are stopped and removed, others are left alone"
+rm -f "$SCHELA_SYSTEMD_DIR"/schela-app*.service "$SCHELA_SYSTEMD_DIR/unrelated.service"
 
 for bin in systemctl journalctl; do
   rm -f "/usr/bin/$bin"
